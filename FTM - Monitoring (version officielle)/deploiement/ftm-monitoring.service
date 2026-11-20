@@ -1,0 +1,20 @@
+# Service FTM - Monitoring (à installer par un administrateur)
+# Emplacement : /etc/systemd/system/ftm-monitoring.service
+# Remplacer <compte> par le compte qui possède la clé SSH du serveur.
+# Activation : sudo systemctl daemon-reload && sudo systemctl enable --now ftm-monitoring
+# Messages   : journalctl -u ftm-monitoring
+
+[Unit]
+Description=FTM - Monitoring, supervision Secure Transport
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+User=<compte>
+WorkingDirectory=/home/<compte>/ftm-monitoring
+ExecStart=/usr/bin/python3 /home/<compte>/ftm-monitoring/supervision.py
+Restart=always
+RestartSec=10
+
+[Install]
+WantedBy=multi-user.target
