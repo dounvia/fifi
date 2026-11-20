@@ -1,0 +1,37 @@
+TEST API REST SECURETRANSPORT - GET/accounts
+
+1.Commande d'appel (curl) :
+curl -X 'GET' \
+  'https://10.132.150.123:8444/api/v2.0/accounts' \
+  -H 'csrfToken: RTCQ-WER4-6L9J-97QV-GXC2-WX9R-EOU0-RJLS' \
+  -H 'accept: application/json'
+
+2. URL cible du endpoint 
+https://10.132.150.123:8444/api/v2.0/accounts
+
+3. Code HTTP retourné :
+200 OK (Successful operation)
+
+4. Extrait d résultat JSON obtenu (4 comptes existants) : 
+{
+  "resultSet": {
+    "returnCount": 4,
+    "totalCount": 4
+  },
+  "result": [
+    {
+      "type": "user",
+      "id": "8a0416fba111ea0f01a135dc63160080",
+      "name": "FLUX_HIBA",
+      "uid": "2001",
+      "gid": "2002",
+      "homeFolder": "/data/NoBU/FLUX_HIBA",
+      "lastModified": "Thu, 15 Oct 2026 10:11:14 +0200",
+      "homeFolderAccessLevel": "PRIVATE",
+      "mappedUser": null,
+      "disabled": false,
+      "skin": "Default HTML Template",
+      "notes": "MDP:1234",
+    }
+  ]
+}

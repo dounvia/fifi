@@ -1,0 +1,327 @@
+#!/usr/bin/env python3
+"""
+Supervision FTM : contrôle des environnements et page web d'état.
+
+Fonctionnement
+--------------
+1. Le script lit environnements.csv (une ligne = un service sur un nœud).
+2. Toutes les N secondes, il teste chaque service :
+     - colonne commande_ssh remplie : la commande est lancée en SSH sur le nœud
+       (code retour 0 = démarré), ex. "systemctl is-active sentinel"
+     - sinon : test de connexion TCP sur ip:port (le port répond = démarré)
+3. Il garde l'historique des 40 derniers contrôles et le journal des changements
+   d'état (sauvegardés dans etat.json pour survivre à un redémarrage).
+4. Il sert la page web (web/index.html) en y injectant les données :
+     GET  /               -> la page
+     GET  /api/etat       -> les données en JSON
+     POST /api/controle   -> lance un contrôle tout de suite et renvoie les données
+
+Python 3.8+ standard uniquement, rien à installer.
+
+Lancement
+---------
+    python supervision.py                 # http://localhost:8080
+    python supervision.py --port 8090 --intervalle 30
+    python supervision.py --demo          # états simulés, sans réseau
+"""
+
+import argparse
+import csv
+import json
+import os
+import random
+import socket
+import subprocess
+import threading
+import time
+from collections import OrderedDict
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime
+from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+DOSSIER = os.path.dirname(os.path.abspath(__file__))
+FICHIER_CSV = os.path.join(DOSSIER, "environnements.csv")          # vraies données : jamais versionné
+FICHIER_EXEMPLE = os.path.join(DOSSIER, "environnements.exemple.csv")  # valeurs fictives, versionné
+FICHIER_PAGE = os.path.join(DOSSIER, "web", "index.html")
+FICHIER_ETAT = os.path.join(DOSSIER, "etat.json")
+
+TIMEOUT = 10         # secondes max par test
+TAILLE_HISTO = 40    # nombre de contrôles gardés par service
+TAILLE_JOURNAL = 50  # nombre d'événements gardés par environnement
+
+NOMS_ENV = {"QUA": "Qualification", "DEV": "Développement", "INT": "Intégration",
+            "REC": "Recette", "PPR": "Pré-production", "PRD": "Production"}
+
+
+# =============================================================== inventaire
+def lire_inventaire():
+    """Retourne la liste des lignes du CSV (dictionnaires), lignes vides ignorées.
+    Utilise environnements.csv s'il existe, sinon le fichier d'exemple."""
+    chemin = FICHIER_CSV if os.path.exists(FICHIER_CSV) else FICHIER_EXEMPLE
+    with open(chemin, encoding="utf-8-sig", newline="") as f:
+        lignes = [{k.strip(): (v or "").strip() for k, v in row.items()}
+                  for row in csv.DictReader(f, delimiter=";")]
+    return [l for l in lignes if l.get("env") and l.get("ip") and l.get("service")]
+
+
+# =============================================================== tests
+import urllib.request
+import urllib.parse
+import ssl
+import json
+def test_tcp(ip, port):
+    """Démarré si le port accepte une connexion."""
+    debut = time.perf_counter()
+    try:
+        with socket.create_connection((ip, int(port)), timeout=TIMEOUT):
+            return True, int((time.perf_counter() - debut) * 1000)
+    except (OSError, ValueError):
+        return False, None
+
+
+def test_ssh(ip, user, commande):
+    cible = "%s@%s" % (user, ip) if user else ip
+    cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=%d" % TIMEOUT,
+           "-o", "StrictHostKeyChecking=no", cible, commande]
+
+    debut = time.perf_counter()
+
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT + 10)
+
+        print("\n----- TEST SSH -----")
+        print("HOST :", ip)
+        print("CMD  :", commande)
+        print("RC   :", r.returncode)
+        print("OUT  :", r.stdout)
+        print("ERR  :", r.stderr)
+        print("--------------------\n")
+
+        return r.returncode == 0, int((time.perf_counter() - debut) * 1000)
+
+    except (OSError, subprocess.SubprocessError):
+        return False, None
+
+
+def tester(ligne, demo=False):
+    if demo:  # simulation : 3 % de chances d'être arrêté
+        ok = random.random() > 0.03
+        return ok, random.randint(3, 45) if ok else None
+    if ligne.get("commande_ssh"):
+        return test_ssh(ligne["ip"], ligne.get("user_ssh"), ligne["commande_ssh"])
+    return test_tcp(ligne["ip"], ligne.get("port") or 22)
+
+
+def tester_tout(lignes, demo=False):
+    """Teste toutes les lignes du CSV.
+    Les vérifications SSH d'une même machine passent par UNE seule connexion."""
+    import re
+    resultats = [None] * len(lignes)
+    groupes = {}   # (compte, ip) -> numéros des lignes à vérifier en SSH
+    autres = []    # numéros des lignes testées par port (TCP)
+    for i, l in enumerate(lignes):
+        if l.get("commande_ssh") and not demo:
+            groupes.setdefault((l.get("user_ssh", ""), l["ip"]), []).append(i)
+        else:
+            autres.append(i)
+
+    def verifier_machine(cle):
+        user, ip = cle
+        numeros = groupes[cle]
+        # Un petit script : chaque commande affiche R<n>=OK ou R<n>=KO
+        script = "; ".join(
+            "if %s >/dev/null 2>&1; then echo R%d=OK; else echo R%d=KO; fi"
+            % (lignes[i]["commande_ssh"], n, n) for n, i in enumerate(numeros))
+        cible = "%s@%s" % (user, ip) if user else ip
+        cmd = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=%d" % TIMEOUT,
+               "-o", "StrictHostKeyChecking=no", "-o", "LogLevel=ERROR", cible, script]
+        etats = {}
+        for essai in range(2):                      # 2 essais si la connexion échoue
+            debut = time.perf_counter()
+            try:
+    r = subprocess.run(cmd, capture_output=True, text=True, timeout=TIMEOUT + 20)
+
+    print("\n===================")
+    print("IP =", ip)
+    print("SCRIPT =", script)
+    print("RC =", r.returncode)
+    print("STDOUT =", repr(r.stdout))
+    print("STDERR =", repr(r.stderr))
+    print("===================\n")
+
+    etats = dict(re.findall(r"R(\d+)=(OK|KO)", r.stdout))
+
+except (OSError, subprocess.SubprocessError):
+    etats = {}
+                etats = dict(re.findall(r"R(\d+)=(OK|KO)", r.stdout))
+            except (OSError, subprocess.SubprocessError):
+                etats = {}
+            if etats:
+                break
+        ms = int((time.perf_counter() - debut) * 1000)
+        for n, i in enumerate(numeros):
+            ok = etats.get(str(n)) == "OK"
+            resultats[i] = (ok, ms if ok else None)
+
+    def verifier_ligne(i):
+        resultats[i] = tester(lignes[i], demo)
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(verifier_machine, list(groupes)))
+        list(pool.map(verifier_ligne, autres))
+    return resultats
+
+
+# =============================================================== état
+class Superviseur:
+    def __init__(self, intervalle, demo):
+        self.intervalle = intervalle
+        self.demo = demo
+        self.verrou = threading.Lock()
+        self.memoire = self._charger()   # {"services": {cle: {...}}, "journal": {env: [...]}}
+        self.donnees = None
+
+    # ---- persistance
+    def _charger(self):
+        try:
+            with open(FICHIER_ETAT, encoding="utf-8") as f:
+                return json.load(f)
+        except (OSError, ValueError):
+            return {"services": {}, "journal": {}}
+
+    def _sauver(self):
+        try:
+            with open(FICHIER_ETAT, "w", encoding="utf-8") as f:
+                json.dump(self.memoire, f, ensure_ascii=False)
+        except OSError:
+            pass
+
+    # ---- un tour de contrôle complet
+    def controler(self):
+        lignes = lire_inventaire()
+        resultats = tester_tout(lignes, self.demo)
+
+        with self.verrou:
+            maintenant = datetime.now()
+            heure = maintenant.strftime("%H:%M")
+            jour = maintenant.strftime("%Y-%m-%d")
+            envs = OrderedDict()
+
+            for ligne, (ok, ms) in zip(lignes, resultats):
+                env = ligne["env"]
+                cle = "|".join((env, ligne["hostname"], ligne["service"]))
+                mem = self.memoire["services"].setdefault(cle, {"ok": ok, "since": heure, "history": []})
+
+                # changement d'état -> journal
+                if mem["history"] and mem["ok"] != ok:
+                    mem["since"] = heure
+                    journal = self.memoire["journal"].setdefault(env, [])
+                    journal.insert(0, {"t": heure, "jour": jour, "node": ligne["noeud"],
+                                       "service": ligne["service"], "ok": ok})
+                    del journal[TAILLE_JOURNAL:]
+                mem["ok"] = ok
+                mem["history"] = (mem["history"] + [1 if ok else 0])[-TAILLE_HISTO:]
+
+                # construction de la structure attendue par la page
+                e = envs.setdefault(env, {"code": env, "name": NOMS_ENV.get(env, env),
+                                          "cluster_csv": "", "nodes": OrderedDict()})
+                if ligne.get("cluster"):
+                    e["cluster_csv"] = ligne["cluster"]
+                n = e["nodes"].setdefault(ligne["noeud"], {
+                    "id": env + "-" + ligne["hostname"], "name": ligne["noeud"],
+                    "role": ligne.get("type") or "traitement", "host": ligne["hostname"],
+                    "ip": ligne["ip"], "sshUser": ligne.get("user_ssh", ""),
+                    "links": [], "services": []})
+                if ligne.get("url"):
+                    n["links"].append({"label": "Ouvrir " + ligne["service"], "url": ligne["url"]})
+                n["services"].append({"name": ligne["service"], "ok": ok, "ms": ms,
+                                      "since": mem["since"], "history": mem["history"]})
+
+            liste = []
+            for code, e in envs.items():
+                noeuds = list(e["nodes"].values())
+                if e["cluster_csv"]:   # valeur imposée dans le CSV (Oui/Non)
+                    cluster = e["cluster_csv"].lower() in ("oui", "o", "yes", "1", "true")
+                else:                  # sinon : cluster si au moins 2 nœuds de traitement
+                    cluster = sum(1 for n in noeuds if n["role"] == "traitement") >= 2
+                journal = [j for j in self.memoire["journal"].get(code, []) if j.get("jour") == jour]
+                liste.append({"code": code, "name": e["name"], "cluster": cluster,
+                              "nodes": noeuds, "journal": journal})
+
+            self.donnees = {"generatedAt": maintenant.isoformat(timespec="seconds"),
+                            "interval": self.intervalle, "envs": liste}
+            self._sauver()
+
+        arretes = sum(1 for ok, _ in resultats if not ok)
+        print("[%s] %d services contrôlés, %d arrêté(s)" % (maintenant.strftime("%H:%M:%S"), len(resultats), arretes))
+        return self.donnees
+
+    def boucle(self):
+        while True:
+            time.sleep(self.intervalle)
+            try:
+                self.controler()
+            except Exception as err:  # le serveur ne doit jamais s'arrêter sur une erreur de contrôle
+                print("Erreur pendant le contrôle :", err)
+
+
+# =============================================================== serveur web
+def fabriquer_handler(sup):
+    class Handler(BaseHTTPRequestHandler):
+        def _envoyer(self, code, contenu, type_):
+            corps = contenu.encode("utf-8")
+            self.send_response(code)
+            self.send_header("Content-Type", type_ + "; charset=utf-8")
+            self.send_header("Content-Length", str(len(corps)))
+            self.send_header("Cache-Control", "no-store")
+            self.end_headers()
+            self.wfile.write(corps)
+
+        def do_GET(self):
+            if self.path in ("/", "/index.html"):
+                with open(FICHIER_PAGE, encoding="utf-8") as f:   # relu à chaque fois : modifs visibles en rechargeant
+                    page = f.read()
+                with sup.verrou:
+                    donnees = json.dumps(sup.donnees, ensure_ascii=False).replace("</", "<\\/")
+                page = page.replace("/*__DATA__*/null", donnees)
+                self._envoyer(200, page, "text/html")
+            elif self.path == "/api/etat":
+                with sup.verrou:
+                    self._envoyer(200, json.dumps(sup.donnees, ensure_ascii=False), "application/json")
+            else:
+                self._envoyer(404, "Page introuvable", "text/plain")
+
+        def do_POST(self):
+            if self.path == "/api/controle":
+                self._envoyer(200, json.dumps(sup.controler(), ensure_ascii=False), "application/json")
+            else:
+                self._envoyer(404, "Page introuvable", "text/plain")
+
+        def log_message(self, *args):  # pas de log à chaque requête
+            pass
+    return Handler
+
+
+def main():
+    p = argparse.ArgumentParser(description="Supervision des environnements FTM")
+    p.add_argument("--port", type=int, default=8080, help="port du serveur web (8080)")
+    p.add_argument("--intervalle", type=int, default=60, help="secondes entre deux contrôles (60)")
+    p.add_argument("--demo", action="store_true", help="états simulés, sans tester le réseau")
+    a = p.parse_args()
+
+    if not os.path.exists(FICHIER_CSV):
+        print("Attention : environnements.csv absent, utilisation des valeurs fictives de environnements.exemple.csv")
+    sup = Superviseur(a.intervalle, a.demo)
+    sup.controler()
+    threading.Thread(target=sup.boucle, daemon=True).start()
+
+    serveur = ThreadingHTTPServer(("0.0.0.0", a.port), fabriquer_handler(sup))
+    print("Supervision FTM disponible sur http://localhost:%d%s" % (a.port, "  (mode démo)" if a.demo else ""))
+    try:
+        serveur.serve_forever()
+    except KeyboardInterrupt:
+        print("\nArrêt.")
+
+
+if __name__ == "__main__":
+    main()
