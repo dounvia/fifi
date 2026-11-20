@@ -1,9 +1,0 @@
-env;type;noeud;hostname;ip;user_ssh;url;cluster
-QUA;traitement;Traitement 1;PF9SOFTM022;10.132.150.201;infoger;https://ftmv8-qua-trt1.rte-France.com:8444/;Oui
-QUA;traitement;Traitement 2;PF9SOFTM023;10.132.150.206;infoger;https://ftmv8-qua-trt2.rte-France.com:8444/;Oui
-QUA;traitement;Traitement 3;PF9SOFTM024;10.132.238.109;infoger;https://ftmv8-qua-trt3.rte-France.com:8444/;Oui
-DEV;traitement;Traitement 1;PF9SOFTM034;10.132.239.131;infoger;https://ftmv8-dev-trt1.rte-France.com:8444/;Oui
-DEV;traitement;Traitement 2;PF9SOFTM035;10.132.23.225;infoger;https://ftmv8-dev-trt2.rte-France.com:8444/;Oui
-INT;traitement;Traitement 1;PF9SOFTM0003;10.132.124.44;infoger;https://ftmv8-int-trt1.rte-France.com:8444/;Oui
-INT;traitement;Traitement 2;PF9SOFTM0004;10.132.124.45;infoger;https://ftmv8-int-trt2.rte-France.com:8444/;Oui
-INT;traitement;Traitement 3;PF9SOFTM0005;10.132.124.46;infoger;https://ftmv8-int-trt3.rte-France.com:8444/;Oui
